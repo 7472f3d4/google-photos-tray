@@ -1,65 +1,79 @@
 # Google フォト — タスクトレイ常駐
 
-Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、
-**PC 起動時に自動起動**するための一式です。外部ツールは不要で、Windows 標準の
-PowerShell + .NET（NotifyIcon）だけで動きます。
-
-## なぜ常駐させるのか
-
-**パソコン版 Google ドライブの「Google フォトへのバックアップ」機能が 2026/8/10 で終了**したため
-（2026/6/15 以降は新規フォルダ追加も不可）、その代替として **Google フォト Web アプリ側の
-「フォルダをバックアップ」機能**で自動アップロードを続けるのが公式の推奨です。
-この機能は **Web アプリが起動している間だけ**動くので、PC 起動時から常にトレイで動かし続けることで
-「フォルダに写真を置けば自動で Google フォトへ上がる」状態を維持します。
+Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、**Windows ログイン時に自動起動**するための一式です。PowerShell と .NET の標準機能を使うため、追加の常駐ツールは必要ありません。
 
 ## 仕組み
 
-- 専用プロファイルで Chrome を「アプリ表示（`--app`）」で起動 → ウィンドウ管理が確実。
-- 起動時はウィンドウを隠してトレイアイコンだけ表示。
-- **トレイアイコン**: 左クリックで表示/非表示の切り替え。右クリックで「表示/非表示・開き直す・終了」。
+- 専用プロファイルで Google Chrome をアプリ表示（`--app`）として起動
+- 初回起動時はウィンドウを表示し、2回目以降はウィンドウを隠してトレイだけで常駐
+- トレイアイコンの左クリックで表示 / 非表示を切り替え
+- 右クリックで「表示 / 非表示」「開き直す」「終了」を選択
+- 専用プロファイルのため、通常のChromeのウィンドウやログイン状態に影響しない
 
-## 使い方
+Google フォト Web アプリの「フォルダをバックアップ」を有効にしておくと、アプリを常駐させたまま指定フォルダーのバックアップを継続できます。
 
-### 初回セットアップ（1 回だけ）
+## 必要環境
 
-1. `photos_tray_hidden.vbs` をダブルクリック。
-2. 専用プロファイルのため、開いたウィンドウで **Google アカウントにログイン**。
-3. Google フォトの **設定 →「フォルダをバックアップ」** で、自動アップロードしたい
-   PC 内のフォルダを指定する（＝ 旧 Google ドライブのバックアップの代わり）。
-4. 設定できたら、**トレイアイコンを左クリックで非表示**にして OK。以後はトレイで動き続けます。
+- Windows 10 / 11
+- Google Chrome がインストール済みであること
+- Google フォトを利用できるGoogleアカウント
 
-> 2 回目以降は、起動するとウィンドウを出さずトレイのみで静かに常駐します。
-> バックアップ状況を見たいときはトレイアイコンを左クリックで表示できます。
+## 配置先
 
-### PC 起動時に自動起動する
+長期運用では、リポジトリやダウンロードフォルダーではなく、次のユーザー単位の配置先を推奨します。管理者権限は不要です。
 
-PowerShell で次を実行（管理者権限は不要）:
+```text
+C:\Users\<ユーザー名>\AppData\Local\Programs\Google Photos Tray
+```
+
+リポジトリのファイルをこのフォルダーへコピーしてから、以降の操作をこの配置先で行ってください。スタートアップ登録は実行したファイルの場所を記録するため、後からフォルダーを移動しないでください。
+
+## 初回セットアップ
+
+1. `photos_tray_hidden.vbs` をダブルクリックする。
+2. 開いた専用Chromeウィンドウで Google アカウントにログインする。
+3. Google フォトの設定から「フォルダをバックアップ」を開き、自動アップロードするPC内のフォルダーを指定する。
+4. 設定後はトレイアイコンを左クリックしてウィンドウを隠す。
+
+専用プロファイルは `%LOCALAPPDATA%\GooglePhotosTray\profile` に保存されます。初回設定が完了する前にPCを再起動した場合は、トレイアイコンの「Reopen」でウィンドウを開いて設定を続けてください。
+
+## Windows ログイン時に自動起動する
+
+PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
 
 ```powershell
+$installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
+Set-Location $installDir
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1
 ```
 
-スタートアップに次のショートカットが作られます:
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Google Photos Tray.lnk`
+次のショートカットがユーザーのスタートアップフォルダーに作成されます。
 
-### 自動起動を解除する
+```text
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Google Photos Tray.lnk
+```
+
+登録直後に試す場合は `photos_tray_hidden.vbs` を実行してください。次回のWindowsログインから、コンソールを表示せずトレイ常駐で起動します。
+
+## 自動起動を解除する
 
 ```powershell
+$installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
+Set-Location $installDir
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -Uninstall
 ```
+
+解除後も現在起動中のChromeとトレイホストは終了しないため、必要に応じてトレイメニューの「Exit」を選んでください。
 
 ## ファイル
 
 | ファイル | 役割 |
 |---|---|
-| `photos_tray.ps1` | 本体（Chrome 起動 + トレイアイコン管理） |
-| `photos_tray_hidden.vbs` | コンソール窓を出さずに本体を起動するランチャー |
+| `photos_tray.ps1` | Chrome起動とトレイアイコン管理の本体 |
+| `photos_tray_hidden.vbs` | コンソールを表示せず本体を起動するランチャー |
 | `install_startup.ps1` | スタートアップ登録 / 解除（`-Uninstall`） |
 
-## メモ
+## 設定値を変更する場合
 
-- アイコンは Chrome の実行ファイルから取得しています（見た目は Chrome アイコン）。
-  Google フォトらしい見た目にしたい場合は `photos_tray.ps1` の `ExtractAssociatedIcon`
-  の箇所を `.ico` 指定に変えれば差し替え可能です。
-- 別アカウント / 別 URL にしたい場合は `photos_tray.ps1` の `-Url` 既定値を変更してください。
-- 専用プロファイルは `%LOCALAPPDATA%\GooglePhotosTray\profile` に作られます。
+- URLや専用プロファイルの場所を変更する場合は、`photos_tray.ps1` の `-Url` / `-UserDataDir` を指定します。
+- 専用プロファイルを削除すると、次回起動時にGoogleアカウントへのログインからやり直しになります。
