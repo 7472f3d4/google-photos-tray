@@ -8,8 +8,9 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $photos     = Join-Path $scriptDir "photos_tray.ps1"
+$startupVbs = Join-Path $scriptDir "photos_tray_startup_hidden.vbs"
 $taskName   = "Google Photos Tray"
-$powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$wscript    = Join-Path $env:SystemRoot "System32\wscript.exe"
 $startup    = [Environment]::GetFolderPath("Startup")
 $lnk        = Join-Path $startup "Google Photos Tray.lnk"
 
@@ -30,10 +31,11 @@ if ($Uninstall) {
 }
 
 if (-not (Test-Path -LiteralPath $photos)) { throw "not found: $photos" }
+if (-not (Test-Path -LiteralPath $startupVbs)) { throw "not found: $startupVbs" }
 
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$photos`" -StartupDelaySeconds 25"
-$action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -WorkingDirectory $scriptDir
+$arguments = "`"$startupVbs`""
+$action = New-ScheduledTaskAction -Execute $wscript -Argument $arguments -WorkingDirectory $scriptDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `

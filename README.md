@@ -39,7 +39,7 @@ C:\Users\<ユーザー名>\AppData\Local\Programs\Google Photos Tray
 
 ## Windows ログイン時に自動起動する
 
-PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。Windows のタスクスケジューラに `Google Photos Tray` タスクを登録し、ログイン後25秒待って起動します。ChromeやWindowsの初期化が間に合わない場合は、最大3回まで自動再試行します。
+PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。Windows のタスクスケジューラに `Google Photos Tray` タスクを登録し、非表示のVBSランチャー経由でログイン後25秒待って起動します。ChromeやWindowsの初期化が間に合わない場合は、最大3回まで自動再試行します。
 
 ```powershell
 $installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
@@ -64,7 +64,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -U
 | ファイル | 役割 |
 |---|---|
 | `photos_tray.ps1` | Chrome起動とトレイアイコン管理の本体 |
-| `photos_tray_hidden.vbs` | コンソールを表示せず本体を起動するランチャー |
+| `photos_tray_hidden.vbs` | 手動起動用のランチャー（待機なし） |
+| `photos_tray_startup_hidden.vbs` | タスクスケジューラ用の非表示ランチャー（25秒待機） |
 | `install_startup.ps1` | タスクスケジューラへの登録 / 解除（`-Uninstall`） |
 
 ## 設定値を変更する場合
