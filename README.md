@@ -39,7 +39,7 @@ C:\Users\<ユーザー名>\AppData\Local\Programs\Google Photos Tray
 
 ## Windows ログイン時に自動起動する
 
-PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
+PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。Windows のタスクスケジューラに `Google Photos Tray` タスクを登録し、ログイン後25秒待って起動します。ChromeやWindowsの初期化が間に合わない場合は、最大3回まで自動再試行します。
 
 ```powershell
 $installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
@@ -47,13 +47,7 @@ Set-Location $installDir
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1
 ```
 
-次のショートカットがユーザーのスタートアップフォルダーに作成されます。
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Google Photos Tray.lnk
-```
-
-登録直後に試す場合は `photos_tray_hidden.vbs` を実行してください。次回のWindowsログインから、コンソールを表示せずトレイ常駐で起動します。
+登録直後に試す場合は `photos_tray_hidden.vbs` を実行してください。次回のWindowsログインから、コンソールを表示せずタスクスケジューラ経由でトレイ常駐します。旧方式のスタートアップショートカットが残っている場合は削除を試みます。残っていても名前付きMutexで二重起動を防ぐため、動作は一重になります。
 
 ## 自動起動を解除する
 
@@ -71,9 +65,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -U
 |---|---|
 | `photos_tray.ps1` | Chrome起動とトレイアイコン管理の本体 |
 | `photos_tray_hidden.vbs` | コンソールを表示せず本体を起動するランチャー |
-| `install_startup.ps1` | スタートアップ登録 / 解除（`-Uninstall`） |
+| `install_startup.ps1` | タスクスケジューラへの登録 / 解除（`-Uninstall`） |
 
 ## 設定値を変更する場合
 
 - URLや専用プロファイルの場所を変更する場合は、`photos_tray.ps1` の `-Url` / `-UserDataDir` を指定します。
 - 専用プロファイルを削除すると、次回起動時にGoogleアカウントへのログインからやり直しになります。
+
+## 起動トラブルの確認
+
+タスクの状態:
+
+```powershell
+Get-ScheduledTask -TaskName "Google Photos Tray" | Select-Object TaskName,State
+```
+
+起動ログ:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\GooglePhotosTray\logs\startup.log" -Tail 80
+```
+
+ログにはChromeの検出、起動待ち、トレイアイコン表示、起動失敗の内容が記録されます。認証情報やChromeのプロファイル内容は記録しません。

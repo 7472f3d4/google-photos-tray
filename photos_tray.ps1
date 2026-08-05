@@ -4,15 +4,44 @@
 #   - トレイアイコン: 左クリックで表示/非表示トグル、右クリックでメニュー
 param(
     [string]$Url         = "https://photos.google.com/",
-    [string]$UserDataDir = "$env:LOCALAPPDATA\GooglePhotosTray\profile"
+    [string]$UserDataDir = "$env:LOCALAPPDATA\GooglePhotosTray\profile",
+    [ValidateRange(0, 300)]
+    [int]$StartupDelaySeconds = 0
 )
 
 $ErrorActionPreference = "Stop"
+$logDir = Join-Path $env:LOCALAPPDATA "GooglePhotosTray\logs"
+$logFile = Join-Path $logDir "startup.log"
+
+function Write-StartupLog {
+    param([string]$Message)
+    try {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        Add-Content -LiteralPath $logFile -Value ("[{0:yyyy-MM-dd HH:mm:ss}] {1}" -f (Get-Date), $Message) -Encoding UTF8
+    }
+    catch {
+        # ログ出力の失敗で本体の起動を妨げない。
+    }
+}
+
+trap {
+    Write-StartupLog ("ERROR: " + $_.Exception.ToString())
+    exit 1
+}
+
+Write-StartupLog ("START pid={0} delay={1}s profile={2}" -f $PID, $StartupDelaySeconds, $UserDataDir)
+if ($StartupDelaySeconds -gt 0) {
+    Write-StartupLog ("Waiting {0} seconds for Windows and Chrome startup." -f $StartupDelaySeconds)
+    Start-Sleep -Seconds $StartupDelaySeconds
+}
 
 # --- 二重起動防止（同一ログインセッション内で 1 つだけ） ---
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "GooglePhotosTrayApp", ([ref]$createdNew))
-if (-not $createdNew) { return }
+if (-not $createdNew) {
+    Write-StartupLog "Another tray host is already running; exiting."
+    return
+}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -52,6 +81,7 @@ function Get-ChromePath {
 }
 
 $chrome = Get-ChromePath
+Write-StartupLog ("Chrome={0}" -f $chrome)
 $script:proc = $null
 $script:hwnd = [IntPtr]::Zero
 
@@ -80,6 +110,7 @@ function Start-Photos {
     if ($existing) {
         $script:proc = $existing
         $script:hwnd = $existing.MainWindowHandle
+        Write-StartupLog ("Using existing Chrome process pid={0}." -f $existing.Id)
         return
     }
     $chromeArgs = @(
@@ -93,6 +124,7 @@ function Start-Photos {
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding"
     )
+    Write-StartupLog "Starting dedicated Chrome profile."
     Start-Process -FilePath $chrome -ArgumentList $chromeArgs -WindowStyle Minimized | Out-Null
     # ランチャーの受け渡しを挟んでも確実に本体ウィンドウを掴めるよう、コマンドライン基準でポーリング。
     $deadline = (Get-Date).AddSeconds(20)
@@ -105,6 +137,10 @@ function Start-Photos {
         }
         Start-Sleep -Milliseconds 200
     }
+    if (-not $script:proc) {
+        throw "Google Chrome window did not appear within 20 seconds."
+    }
+    Write-StartupLog ("Chrome window attached pid={0}." -f $script:proc.Id)
 }
 
 function Show-Photos {
@@ -135,6 +171,7 @@ function Toggle-Photos {
 # 初回（専用プロファイル未作成）はログインと「フォルダをバックアップ」設定が必要なので
 # ウィンドウを表示する。2回目以降はトレイのみで静かに起動。
 $firstRun = -not (Test-Path -LiteralPath $UserDataDir)
+Write-StartupLog ("FirstRun={0}" -f $firstRun)
 Start-Photos
 if (-not $firstRun) { Hide-Photos }
 
@@ -146,6 +183,7 @@ $ni = New-Object System.Windows.Forms.NotifyIcon
 $ni.Icon = $icon
 $ni.Text = "Google Photos"
 $ni.Visible = $true
+Write-StartupLog "Tray icon is visible."
 
 if ($firstRun) {
     $ni.BalloonTipTitle = "Google Photos tray started"
@@ -170,10 +208,12 @@ $miReopen.add_Click({
     Show-Photos
 })
 $miExit.add_Click({
+    Write-StartupLog "Exit requested from tray menu."
     $ni.Visible = $false
     try { if ($script:proc -and -not $script:proc.HasExited) { $script:proc.Kill() } } catch {}
     [System.Windows.Forms.Application]::Exit()
 })
 
 [System.Windows.Forms.Application]::Run()
+Write-StartupLog "Tray host stopped."
 try { $mutex.ReleaseMutex() } catch {}
