@@ -37,7 +37,7 @@ if [ ! -f "$policy" ]; then
   echo "main-only push policy is missing: $policy" >&2
   exit 1
 fi
-sh "$policy" "$@"
+ "$policy" "$@"
 status=$?
 if [ "$status" -ne 0 ]; then
   exit "$status"
@@ -57,4 +57,3 @@ git config --local --replace-all "remote.$Remote.push" "HEAD:refs/heads/main"
 git config --local "branch.main.remote" $Remote
 git config --local "branch.main.merge" "refs/heads/main"
 Write-Output "Installed main-only push policy for $Remote in $root"
-
