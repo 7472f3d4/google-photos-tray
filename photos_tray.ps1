@@ -2,6 +2,7 @@
 #   - Pictures / Videos を FileSystemWatcher で監視し、待機中は Chrome を起動しない
 #   - メディア変更時だけ専用 Chrome を画面外で可視状態にして Google フォトを動かす
 #   - トレイ操作時だけ通常のウィンドウを表示する
+#Requires -Version 7.0
 param(
     [string]$Url         = "https://photos.google.com/",
     [string]$UserDataDir = "$env:LOCALAPPDATA\GooglePhotosTray\profile",
@@ -18,6 +19,7 @@ $ErrorActionPreference = "Stop"
 $logDir = Join-Path $env:LOCALAPPDATA "GooglePhotosTray\logs"
 $logFile = Join-Path $logDir "startup.log"
 $stateFile = Join-Path $env:LOCALAPPDATA "GooglePhotosTray\media-state.json"
+$authenticationStateFile = Join-Path $env:LOCALAPPDATA "GooglePhotosTray\authentication-required.json"
 
 function Write-StartupLog {
     param([string]$Message)
@@ -58,7 +60,7 @@ try {
     $script:uiAutomationAvailable = $true
 }
 catch {
-    Write-StartupLog ("WARN: Google Photos completion detection unavailable: " + $_.Exception.Message)
+    Write-StartupLog ("WARN: Google Photos UI detection unavailable: " + $_.Exception.Message)
 }
 
 Add-Type @"
@@ -243,6 +245,15 @@ $script:syncCompletionObserved = $false
 $script:syncCompletionUtc = [DateTime]::MinValue
 $script:syncFailureObserved = $false
 $script:syncStatusLogWritten = $false
+$script:uiAutomationWarningWritten = $false
+$script:lastUiReadUtc = [DateTime]::MinValue
+$script:cachedUiNames = @()
+$script:authenticationRequired = Test-Path -LiteralPath $authenticationStateFile
+$script:authenticationClearChecks = 0
+$script:lastAuthenticationCheckUtc = [DateTime]::MinValue
+$script:authenticationNoticeShown = $false
+$script:authenticationDetectedDuringSync = $false
+$script:notifyIcon = $null
 $script:lastRescanUtc = [DateTime]::MinValue
 $script:rescanRequested = $false
 $script:watchQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
@@ -251,6 +262,24 @@ $script:candidates = @{}
 $script:pendingSync = @{}
 $script:mediaState = @{}
 $script:stateLoaded = $false
+
+$script:authenticationPatterns = @(
+    '^ログイン$',
+    '^サインイン$',
+    'Google アカウントにログイン',
+    'Google アカウントを使用',
+    'アカウントを選択',
+    '別のアカウントを使用',
+    'ログイン.*Google',
+    'Google フォトに移動',
+    '(?i)^sign in$',
+    '(?i)sign in (to|with) (google|your google account)',
+    '(?i)use your google account',
+    '(?i)^choose an account$',
+    '(?i)^use another account$',
+    '(?i)^go to google photos$',
+    '(?i)^sign in\s*[-–—]\s*google'
+)
 
 $script:watchRoots = @(
     (Join-Path $env:USERPROFILE "Pictures"),
@@ -527,7 +556,7 @@ function Start-Photos {
     param([switch]$ShowWindow)
     if ($script:starting -or $script:exitRequested) { return }
     if ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
-        if ($ShowWindow) { Show-PhotosWindow } else { Set-PhotosBackground }
+        if ($ShowWindow -or $script:authenticationRequired) { Show-PhotosWindow } else { Set-PhotosBackground }
         return
     }
 
@@ -566,7 +595,7 @@ function Start-Photos {
             Capture-NormalWindowRect
             Write-StartupLog ("Chrome window attached pid={0}." -f $script:proc.Id)
         }
-        if ($ShowWindow) { Show-PhotosWindow } else { Set-PhotosBackground }
+        if ($ShowWindow -or $script:authenticationRequired) { Show-PhotosWindow } else { Set-PhotosBackground }
     }
     finally {
         $script:starting = $false
@@ -581,18 +610,31 @@ function Stop-Photos {
     $script:hwnd = [IntPtr]::Zero
     $script:normalRect = $null
     $script:backgrounded = $false
+    $script:lastUiReadUtc = [DateTime]::MinValue
+    $script:cachedUiNames = @()
+    $script:lastAuthenticationCheckUtc = [DateTime]::MinValue
 }
 
 function Ensure-SyncBrowser {
     if (-not $script:syncActive -or $script:exitRequested) { return }
     if ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
-        if (-not $script:backgrounded) { Set-PhotosBackground }
+        if ($script:authenticationRequired) {
+            if ($script:backgrounded) { Show-PhotosWindow }
+        }
+        elseif (-not $script:backgrounded) {
+            Set-PhotosBackground
+        }
         return
     }
     $script:proc = $null
     $script:hwnd = [IntPtr]::Zero
     try {
-        Write-StartupLog "Sync Chrome disappeared; restarting it off-screen."
+        if ($script:authenticationRequired) {
+            Write-StartupLog "Authentication recovery Chrome disappeared; reopening it on-screen."
+        }
+        else {
+            Write-StartupLog "Sync Chrome disappeared; restarting it off-screen."
+        }
         Start-Photos
     }
     catch {
@@ -611,14 +653,19 @@ function Start-MediaSync {
         $script:syncCompletionUtc = [DateTime]::MinValue
         $script:syncFailureObserved = $false
         $script:syncStatusLogWritten = $false
+        if ($script:authenticationRequired) { $script:authenticationDetectedDuringSync = $true }
         Write-StartupLog "Media sync session started."
     }
     Ensure-SyncBrowser
 }
 
-function Get-PhotosStatusMessages {
+function Get-PhotosUiNames {
     if (-not $script:uiAutomationAvailable -or $script:hwnd -eq [IntPtr]::Zero -or -not [Win32]::IsWindow($script:hwnd)) {
         return @()
+    }
+    $now = [DateTime]::UtcNow
+    if (($now - $script:lastUiReadUtc).TotalMilliseconds -lt 750) {
+        return @($script:cachedUiNames)
     }
     try {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($script:hwnd)
@@ -626,26 +673,161 @@ function Get-PhotosStatusMessages {
         $all = $root.FindAll(
             [System.Windows.Automation.TreeScope]::Descendants,
             [System.Windows.Automation.Condition]::TrueCondition)
-        $messages = New-Object System.Collections.Generic.List[string]
+        $names = New-Object System.Collections.Generic.List[string]
         foreach ($element in $all) {
             try {
                 $name = [string]$element.Current.Name
-                if ($name -and $name -match 'バックアップ|アップロード|同期|Backup|Upload|Sync') {
-                    if (-not $messages.Contains($name)) { $messages.Add($name) }
+                if ($name -and -not $names.Contains($name)) {
+                    $names.Add($name)
                 }
             }
             catch {
                 # 動的に消えたUI要素は無視する。
             }
         }
-        return @($messages)
+        $script:cachedUiNames = @($names)
+        $script:lastUiReadUtc = $now
+        return @($script:cachedUiNames)
     }
     catch {
-        if (-not $script:syncStatusLogWritten) {
-            Write-StartupLog ("WARN: Google Photos completion status read failed: " + $_.Exception.Message)
-            $script:syncStatusLogWritten = $true
+        if (-not $script:uiAutomationWarningWritten) {
+            Write-StartupLog ("WARN: Google Photos UI status read failed: " + $_.Exception.Message)
+            $script:uiAutomationWarningWritten = $true
         }
         return @()
+    }
+}
+
+function Get-PhotosStatusMessages {
+    return @(Get-PhotosUiNames | Where-Object {
+        $_ -match 'バックアップ|アップロード|同期|Backup|Upload|Sync'
+    })
+}
+
+function Test-PhotosAuthenticationRequiredFromNames {
+    param([string[]]$Names)
+    foreach ($name in @($Names)) {
+        foreach ($pattern in $script:authenticationPatterns) {
+            if ($name -match $pattern) { return $true }
+        }
+    }
+    return $false
+}
+
+function Test-PhotosAuthenticatedFromNames {
+    param([string[]]$Names)
+    $navigationMarkers = @{}
+    foreach ($name in @($Names)) {
+        if ($name -match 'Google アカウント[:：]|(?i)Google Account:') {
+            return $true
+        }
+        if ($name -match '^(フォト|写真|思い出|アルバム|コレクション|作成|お気に入り|最近追加した写真|アーカイブ|検索|共有|Photos|Memories|Albums|Collections|Create|Favorites|Recently added|Archive|Search|Sharing)$') {
+            $navigationMarkers[$name.ToLowerInvariant()] = $true
+        }
+    }
+    return $navigationMarkers.Count -ge 2
+}
+
+function Save-PhotosAuthenticationState {
+    try {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $authenticationStateFile) -Force | Out-Null
+        [ordered]@{
+            schemaVersion = 1
+            authenticationRequired = $true
+            detectedUtc = [DateTime]::UtcNow.ToString('o')
+        } | ConvertTo-Json | Set-Content -LiteralPath $authenticationStateFile -Encoding UTF8
+    }
+    catch {
+        Write-StartupLog ("WARN: authentication state could not be saved: " + $_.Exception.Message)
+    }
+}
+
+function Clear-PhotosAuthenticationState {
+    try {
+        if (Test-Path -LiteralPath $authenticationStateFile) {
+            Remove-Item -LiteralPath $authenticationStateFile -Force
+        }
+    }
+    catch {
+        Write-StartupLog ("WARN: authentication state could not be cleared: " + $_.Exception.Message)
+    }
+}
+
+function Show-PhotosAuthenticationNotice {
+    param([switch]$Recovered)
+    if (-not $script:notifyIcon) { return }
+    if ($Recovered) {
+        $script:notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+        $script:notifyIcon.BalloonTipTitle = 'Google フォトのログインを確認しました'
+        $script:notifyIcon.BalloonTipText = '専用Chromeで同期を再開します。'
+    }
+    else {
+        $script:notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+        $script:notifyIcon.BalloonTipTitle = 'Google フォトへの再ログインが必要です'
+        $script:notifyIcon.BalloonTipText = '専用Chromeを表示しました。ログインすると同期は自動的に再開します。'
+    }
+    $script:notifyIcon.ShowBalloonTip(15000)
+}
+
+function Set-PhotosAuthenticationRequired {
+    param([bool]$Required)
+    if ($Required) {
+        $newlyDetected = -not $script:authenticationRequired
+        $script:authenticationRequired = $true
+        $script:authenticationClearChecks = 0
+        if ($script:syncActive) { $script:authenticationDetectedDuringSync = $true }
+        if ($newlyDetected) {
+            $script:authenticationNoticeShown = $false
+            Save-PhotosAuthenticationState
+            Write-StartupLog 'Google Photos sign-in is required; showing the dedicated Chrome window.'
+        }
+        if ($script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
+            Show-PhotosWindow
+        }
+        if (-not $script:authenticationNoticeShown -and $script:notifyIcon) {
+            Show-PhotosAuthenticationNotice
+            $script:authenticationNoticeShown = $true
+        }
+        return
+    }
+
+    if (-not $script:authenticationRequired) { return }
+    $resumeBackgroundSync = $script:syncActive -and $script:authenticationDetectedDuringSync
+    $script:authenticationRequired = $false
+    $script:authenticationClearChecks = 0
+    $script:authenticationNoticeShown = $false
+    $script:authenticationDetectedDuringSync = $false
+    Clear-PhotosAuthenticationState
+    Write-StartupLog 'Google Photos sign-in recovery detected.'
+    Show-PhotosAuthenticationNotice -Recovered
+    if ($resumeBackgroundSync) {
+        $script:lastMediaEventUtc = [DateTime]::UtcNow
+        Set-PhotosBackground
+    }
+}
+
+function Update-PhotosAuthenticationState {
+    if (-not $script:uiAutomationAvailable -or $script:hwnd -eq [IntPtr]::Zero -or -not [Win32]::IsWindow($script:hwnd)) {
+        return
+    }
+    $now = [DateTime]::UtcNow
+    if (($now - $script:lastAuthenticationCheckUtc).TotalSeconds -lt 2) { return }
+    $script:lastAuthenticationCheckUtc = $now
+    $names = @(Get-PhotosUiNames)
+    if ($names.Count -eq 0) { return }
+
+    if (Test-PhotosAuthenticationRequiredFromNames $names) {
+        Set-PhotosAuthenticationRequired $true
+        return
+    }
+    if ($script:authenticationRequired -and (Test-PhotosAuthenticatedFromNames $names)) {
+        $script:authenticationClearChecks++
+        if ($script:authenticationClearChecks -ge 3) {
+            Set-PhotosAuthenticationRequired $false
+        }
+    }
+    elseif ($script:authenticationRequired) {
+        $script:authenticationClearChecks = 0
     }
 }
 
@@ -688,6 +870,10 @@ function Test-PhotosSyncCompleted {
 
 function Stop-MediaSync {
     if (-not $script:syncActive) { return }
+    if ($script:authenticationRequired) {
+        Write-StartupLog 'Media sync remains pending until Google Photos sign-in is restored.'
+        return
+    }
     foreach ($path in @($script:pendingSync.Keys)) {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             try { $script:mediaState[$path] = $script:pendingSync[$path] } catch {}
@@ -709,6 +895,7 @@ function Stop-MediaSync {
     $script:syncCompletionUtc = [DateTime]::MinValue
     $script:syncFailureObserved = $false
     $script:syncStatusLogWritten = $false
+    $script:authenticationDetectedDuringSync = $false
     Stop-Photos
 }
 
@@ -725,6 +912,10 @@ function Invoke-MainTick {
     if ($script:pendingSync.Count -gt 0) { Start-MediaSync }
     if ($script:syncActive) {
         Ensure-SyncBrowser
+    }
+    Update-PhotosAuthenticationState
+    if ($script:authenticationRequired) { return }
+    if ($script:syncActive) {
         $completionDetected = Test-PhotosSyncCompleted
         if ($completionDetected -and
             ([DateTime]::UtcNow - $script:lastMediaEventUtc).TotalSeconds -ge 3 -and
@@ -744,6 +935,9 @@ function Toggle-Photos {
         return
     }
     if ($script:backgrounded) {
+        Show-PhotosWindow
+    }
+    elseif ($script:authenticationRequired) {
         Show-PhotosWindow
     }
     elseif ($script:syncActive) {
@@ -769,7 +963,7 @@ if ($script:watchRoots.Count -eq 0) {
 }
 
 $firstRun = -not (Test-Path -LiteralPath $UserDataDir)
-if ($firstRun -or $OpenNow) {
+if ($firstRun -or $OpenNow -or $script:authenticationRequired) {
     Start-Photos -ShowWindow
 }
 else {
@@ -781,6 +975,7 @@ try { $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($chrome) }
 catch { $icon = [System.Drawing.SystemIcons]::Application }
 
 $ni = New-Object System.Windows.Forms.NotifyIcon
+$script:notifyIcon = $ni
 $ni.Icon = $icon
 $ni.Text = "Google Photos"
 $ni.Visible = $true
@@ -790,6 +985,10 @@ if ($firstRun) {
     $ni.BalloonTipTitle = "Google Photos tray started"
     $ni.BalloonTipText = "Sign in in the window that opened, then enable Google Photos folder backup. The tray will wake Google Photos only when media changes."
     $ni.ShowBalloonTip(15000)
+}
+elseif ($script:authenticationRequired) {
+    Show-PhotosAuthenticationNotice
+    $script:authenticationNoticeShown = $true
 }
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -801,7 +1000,7 @@ $ni.ContextMenuStrip = $menu
 $ni.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Toggle-Photos } })
 $miToggle.add_Click({ Toggle-Photos })
 $miReopen.add_Click({ Reopen-Photos })
-$miSync.add_Click({ $script:syncActive = $true; $script:lastMediaEventUtc = [DateTime]::UtcNow; Start-Photos; Write-StartupLog "Manual sync requested." })
+$miSync.add_Click({ $script:lastMediaEventUtc = [DateTime]::UtcNow; Start-MediaSync; Write-StartupLog "Manual sync requested." })
 $miExit.add_Click({
     Write-StartupLog "Exit requested from tray menu."
     $script:exitRequested = $true
@@ -822,5 +1021,6 @@ $timer.Stop()
 Dispose-MediaWatchers
 Stop-Photos
 $ni.Visible = $false
+$script:notifyIcon = $null
 Write-StartupLog "Tray host stopped."
 try { $mutex.ReleaseMutex() } catch {}

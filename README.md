@@ -1,6 +1,6 @@
 # Google フォト — タスクトレイ常駐
 
-Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、**Windows ログイン時に自動起動**するための一式です。PowerShell と .NET の標準機能を使うため、追加の常駐ツールは必要ありません。
+Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、**Windows ログイン時に自動起動**するための一式です。最新版のPowerShell 7と.NETの標準機能を使うため、追加の常駐ツールは必要ありません。
 
 ## 仕組み
 
@@ -8,6 +8,7 @@ Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（
 - 待機中はChromeを起動せず、トレイホストだけが常駐
 - メディアの追加・変更を検知したときだけ、専用Chromeを画面外の可視ウィンドウとして起動
 - Googleフォトの「バックアップしました / バックアップ完了」を検知したらChromeを終了し、CPU・メモリを解放（表示を検知できない場合は最後の変更から5分間静かになった時点を安全な代替にする）
+- 専用プロファイルがログアウトしていたらサインイン画面を自動的に画面内へ表示し、再ログインを確認するまで同期対象を完了扱いにしない
 - トレイアイコンの左クリックで表示 / 非表示を切り替え、右クリックで「表示 / 非表示」「開き直す」「今すぐ同期」「終了」を選択
 - 専用プロファイルのため、通常のChromeのウィンドウやログイン状態に影響しない
 
@@ -16,6 +17,7 @@ Google フォトの「フォルダをバックアップ」はWebアプリが動�
 ## 必要環境
 
 - Windows 10 / 11
+- 最新版のPowerShell 7（`pwsh`。Windows PowerShell 5.1は使用しません）
 - Google Chrome がインストール済みであること
 - Google フォトを利用できるGoogleアカウント
 
@@ -38,24 +40,46 @@ C:\Users\<ユーザー名>\AppData\Local\Programs\Google Photos Tray
 
 専用プロファイルは `%LOCALAPPDATA%\GooglePhotosTray\profile` に保存されます。通常運用では、`C:\Users\<ユーザー名>\Pictures` と `C:\Users\<ユーザー名>\Videos` の配下に画像・動画を保存すると自動同期します。
 
+## Googleからログアウトした場合
+
+メディア同期中にGoogleのサインイン画面を検出すると、画面外で動かしていた専用Chromeを
+自動的に画面内へ戻し、通知を表示します。そのウィンドウで再ログインしてください。
+Googleフォト画面への復帰を確認すると、保留していた同期を自動的に再開します。
+
+再ログインが必要な状態は
+`%LOCALAPPDATA%\GooglePhotosTray\authentication-required.json`へ保存されるため、
+Windowsへ再サインインした場合もログイン画面を再表示できます。このファイルに入るのは
+状態と検出時刻だけです。パスワード、Cookie、トークン、メールアドレスはリポジトリ、
+ログ、状態ファイルへ保存しません。専用Chromeプロファイル自体は従来どおりChromeが
+ローカル管理します。
+
+画面が自動表示されない場合は、トレイメニューの「Reopen」または
+`photos_tray_hidden.vbs`で専用ウィンドウを開いてください。
+
 ## Windows ログイン時に自動起動する
 
-PowerShell で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。Windows のタスクスケジューラに `Google Photos Tray` タスクを登録し、非表示のVBSランチャー経由でログイン後25秒待ってトレイホストだけを起動します。Chromeはメディア変更時まで起動しません。
+PowerShell 7で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
+インストール済みの`pwsh.exe`をファイルバージョンで比較し、最新版をWindowsの
+タスクスケジューラへ直接登録します。Windowsログイン後25秒待ってトレイホストだけを
+起動し、Chromeはメディア変更時まで起動しません。
 
 ```powershell
 $installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
 Set-Location $installDir
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1
+pwsh -NoProfile -File .\install_startup.ps1
 ```
 
-登録直後に試す場合は `photos_tray_startup_hidden.vbs` を実行してください。次回のWindowsログインから、コンソールを表示せずタスクスケジューラ経由で軽量なメディア監視が始まります。旧方式のスタートアップショートカットが残っている場合は削除を試みます。残っていても名前付きMutexで二重起動を防ぐため、動作は一重になります。
+登録直後に試す場合は`Start-ScheduledTask -TaskName "Google Photos Tray"`を実行して
+ください。次回のWindowsログインから、コンソールを表示せずタスクスケジューラ経由で
+軽量なメディア監視が始まります。旧方式のスタートアップショートカットが残っている
+場合は削除を試みます。残っていても名前付きMutexで二重起動を防ぐため、動作は一重です。
 
 ## 自動起動を解除する
 
 ```powershell
 $installDir = "$env:LOCALAPPDATA\Programs\Google Photos Tray"
 Set-Location $installDir
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -Uninstall
+pwsh -NoProfile -File .\install_startup.ps1 -Uninstall
 ```
 
 解除後も現在起動中のChromeとトレイホストは終了しないため、必要に応じてトレイメニューの「Exit」を選んでください。
@@ -66,8 +90,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -U
 |---|---|
 | `photos_tray.ps1` | メディア監視、必要時のChrome起動、トレイアイコン管理の本体 |
 | `photos_tray_hidden.vbs` | 初回設定・手動表示用のランチャー（待機なし） |
-| `photos_tray_startup_hidden.vbs` | タスクスケジューラ用の非表示ランチャー（25秒待機） |
-| `install_startup.ps1` | タスクスケジューラへの登録 / 解除（`-Uninstall`） |
+| `photos_tray_startup_hidden.vbs` | 互換用の非表示ランチャー（25秒待機） |
+| `resolve_latest_pwsh.vbs` | VBSから最新版の`pwsh.exe`を選ぶ共通処理 |
+| `install_startup.ps1` | 最新版PowerShell 7を使うタスクの登録 / 解除（`-Uninstall`） |
 
 ## 設定値を変更する場合
 
@@ -75,6 +100,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_startup.ps1 -U
 - 同期完了表示を検知できない場合の無変更タイムアウトは `-SyncQuietSeconds`（既定300秒）で変更できます。
 - 再スキャン間隔は `-RescanIntervalSeconds`（既定600秒）で変更できます。ファイルイベントを取りこぼした場合の保険です。
 - 専用プロファイルを削除すると、次回起動時にGoogleアカウントへのログインからやり直しになります。
+- Chromeの実行ファイルはトレイホスト起動ごとにレジストリと標準配置先から再検出するため、通常のChrome更新後も同じ専用プロファイルを引き継ぎます。
 
 ## 起動トラブルの確認
 
@@ -90,4 +116,12 @@ Get-ScheduledTask -TaskName "Google Photos Tray" | Select-Object TaskName,State
 Get-Content "$env:LOCALAPPDATA\GooglePhotosTray\logs\startup.log" -Tail 80
 ```
 
-ログには監視対象、メディア変更、Chromeの必要時起動、終了、再試行の内容が記録されます。認証情報やChromeのプロファイル内容は記録しません。既知のメディア状態は `%LOCALAPPDATA%\GooglePhotosTray\media-state.json` に保存されます。
+ログには監視対象、メディア変更、Chromeの必要時起動、終了、再試行、再ログイン要求と
+復旧の内容が記録されます。認証情報やChromeのプロファイル内容は記録しません。
+既知のメディア状態は `%LOCALAPPDATA%\GooglePhotosTray\media-state.json` に保存されます。
+
+認証画面の判定を変更した場合は、最新版のPowerShell 7で回帰テストを実行します。
+
+```powershell
+pwsh -NoProfile -File .\tests\Test-AuthenticationDetection.ps1
+```

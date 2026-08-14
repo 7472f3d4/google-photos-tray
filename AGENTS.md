@@ -13,7 +13,7 @@
 クローン直後、またはCodexアカウント／作業環境が変わったときに、リポジトリルートで次を一度実行します。
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\codex\Install-MainOnlyPushPolicy.ps1
+pwsh -NoProfile -File .\codex\Install-MainOnlyPushPolicy.ps1
 ```
 
 このスクリプトは、ローカルのpre-pushフックを設定し、`git push origin`の既定refspecを現在のHEADから`origin/main`へ向けます。認証は現在のGitHub/Git設定を使用し、資格情報を記録・送信しません。既存のpre-pushフックがあれば`.git/hooks/pre-push.previous`へ退避して、main検査後に引き継ぎます。
