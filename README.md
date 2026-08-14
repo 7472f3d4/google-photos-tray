@@ -7,9 +7,10 @@ Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（
 - `Pictures` と `Videos` の配下をファイルイベントで監視（画像・動画だけを対象）
 - 待機中はChromeを起動せず、トレイホストだけが常駐
 - メディアの追加・変更を検知したときだけ、専用Chromeを画面外の可視ウィンドウとして起動
-- Googleフォトの「バックアップしました / バックアップ完了」を検知したらChromeを終了し、CPU・メモリを解放（表示を検知できない場合は最後の変更から5分間静かになった時点を代替にする）
-- バックアップエラーや未完了件数を検知した場合は、保留ファイルを同期済み扱いにせず、Chromeを表示したまま再試行待ちにする
-- 専用プロファイルがログアウトしていたらサインイン画面を自動的に画面内へ表示し、再ログインを確認するまで同期対象を完了扱いにしない
+- Googleフォトの「バックアップしました / バックアップ完了」を確認できたときだけ、バックグラウンドChromeを終了する
+- バックアップエラーや未完了件数を検知した場合は、保留ファイルを同期済み扱いにせず、画面外のChromeで再試行する
+- 専用プロファイルがログアウトしていたら画面を自動表示せず、通知だけ出して同期を保留する。「Show」または「Reopen」でログイン画面を表示する
+- 「Show」または「Reopen」で表示したChromeは、「Hide」または右上の「×」を押すまで表示を維持する
 - トレイアイコンの左クリックで表示 / 非表示を切り替え、右クリックで「表示 / 非表示」「開き直す」「今すぐ同期」「終了」を選択
 - 専用プロファイルのため、通常のChromeのウィンドウやログイン状態に影響しない
 
@@ -43,9 +44,9 @@ C:\Users\<ユーザー名>\AppData\Local\Programs\Google Photos Tray
 
 ## Googleからログアウトした場合
 
-メディア同期中にGoogleのサインイン画面を検出すると、画面外で動かしていた専用Chromeを
-自動的に画面内へ戻し、通知を表示します。そのウィンドウで再ログインしてください。
-Googleフォト画面への復帰を確認すると、保留していた同期を自動的に再開します。
+メディア同期中にGoogleのサインイン画面を検出しても、専用Chromeは自動表示せず、通知だけを出して保留します。
+トレイの「Show」または「Reopen」で専用Chromeを表示し、そのウィンドウで再ログインしてください。
+Googleフォト画面への復帰を確認すると、現在の表示状態を保ったまま保留していた同期を自動的に再開します。
 
 再ログインが必要な状態は
 `%LOCALAPPDATA%\GooglePhotosTray\authentication-required.json`へ保存されるため、
@@ -54,7 +55,7 @@ Windowsへ再サインインした場合もログイン画面を再表示でき�
 ログ、状態ファイルへ保存しません。専用Chromeプロファイル自体は従来どおりChromeが
 ローカル管理します。
 
-画面が自動表示されない場合は、トレイメニューの「Reopen」または
+認証切れ時に画面が自動表示されないのは仕様です。トレイメニューの「Show」または「Reopen」、
 `photos_tray_hidden.vbs`で専用ウィンドウを開いてください。
 
 ## Windows ログイン時に自動起動する
@@ -126,4 +127,7 @@ Get-Content "$env:LOCALAPPDATA\GooglePhotosTray\logs\startup.log" -Tail 80
 
 ```powershell
 pwsh -NoProfile -File .\tests\Test-AuthenticationDetection.ps1
+pwsh -NoProfile -File .\tests\Test-BackupFailureDetection.ps1
+pwsh -NoProfile -File .\tests\Test-DisplayState.ps1
+pwsh -NoProfile -File .\tests\Test-MediaSyncFailure.ps1
 ```

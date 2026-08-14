@@ -12,7 +12,11 @@ param(
     [ValidateRange(30, 1800)]
     [int]$SyncQuietSeconds = 300,
     [ValidateRange(60, 3600)]
-    [int]$RescanIntervalSeconds = 600
+    [int]$RescanIntervalSeconds = 600,
+    [ValidateRange(15, 3600)]
+    [int]$FailureRetrySeconds = 60,
+    [ValidateRange(1, 5)]
+    [int]$MaxFailureRetries = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,6 +88,7 @@ public static class Win32 {
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT rect);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr h, uint message, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtr", SetLastError=true)]
     static extern IntPtr GetWindowLongPtr64(IntPtr h, int index);
@@ -149,6 +154,9 @@ public static class Win32 {
     public const int SW_HIDE = 0;
     public const int SW_RESTORE = 9;
     public const int SW_SHOWNOACTIVATE = 4;
+    public const uint WM_KEYDOWN = 0x0100;
+    public const uint WM_KEYUP = 0x0101;
+    public const int VK_F5 = 0x74;
 }
 
 public sealed class TrayMediaWatcher : IDisposable {
@@ -234,6 +242,7 @@ $script:proc = $null
 $script:hwnd = [IntPtr]::Zero
 $script:normalRect = $null
 $script:backgrounded = $false
+$script:manualVisible = $false
 $script:starting = $false
 $script:exitRequested = $false
 $script:syncActive = $false
@@ -245,9 +254,12 @@ $script:syncCompletionObserved = $false
 $script:syncCompletionUtc = [DateTime]::MinValue
 $script:syncFailureObserved = $false
 $script:syncFailureStatusSeenClear = $false
+$script:syncFailureRetryCount = 0
+$script:syncFailureNextRetryUtc = [DateTime]::MinValue
 $script:syncFailureNoticeShown = $false
 $script:syncFailureHoldNoticeWritten = $false
 $script:syncFailureBrowserExitLogWritten = $false
+$script:syncCompletionHoldNoticeWritten = $false
 $script:syncStatusLogWritten = $false
 $script:uiAutomationWarningWritten = $false
 $script:lastUiReadUtc = [DateTime]::MinValue
@@ -292,8 +304,10 @@ $script:watchRoots = @(
 
 $script:mediaExtensions = @{}
 @(
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff", ".avif",
-    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mts", ".m2ts", ".3gp", ".webm"
+    # GoogleフォトのWebフォルダーバックアップが案内している形式だけを対象にする。
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".avif",
+    ".mpg", ".mod", ".mmv", ".tod", ".wmv", ".asf", ".avi", ".divx", ".mov", ".m4v",
+    ".3gp", ".3g2", ".mp4", ".m2t", ".m2ts", ".mts", ".mkv"
 ) | ForEach-Object { $script:mediaExtensions[$_] = $true }
 
 function Test-IsMediaPath {
@@ -306,6 +320,44 @@ function Test-IsMediaPath {
 function Get-MediaFingerprint {
     param($Item)
     return ("{0}|{1}" -f $Item.Length, $Item.LastWriteTimeUtc.Ticks)
+}
+
+function Get-GooglePhotosMediaIssue {
+    param([System.IO.FileInfo]$Item)
+    if (-not $Item) { return 'ファイルを読み取れません' }
+
+    # GoogleフォトのWebバックアップの上限。超過ファイルを待ち続けない。
+    if ($Item.Length -gt 200MB) { return '写真のサイズが200 MBを超えています' }
+    if ($Item.Extension.ToLowerInvariant() -in @('.mpg','.mod','.mmv','.tod','.wmv','.asf','.avi','.divx','.mov','.m4v','.3gp','.3g2','.mp4','.m2t','.m2ts','.mts','.mkv')) {
+        if ($Item.Length -gt 10GB) { return '動画のサイズが10 GBを超えています' }
+        return $null
+    }
+
+    # Web版は写真の縦横が256ピクセル以下のファイルを受け付けない。
+    # Windows標準デコーダーで読めない形式は、Google側の判定に任せる。
+    if ($Item.Extension.ToLowerInvariant() -in @('.jpg','.jpeg','.png','.gif')) {
+        $stream = $null
+        $image = $null
+        try {
+            $stream = [IO.File]::Open($Item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $image = [System.Drawing.Image]::FromStream($stream, $false, $true)
+            if ($image.Width -le 256 -or $image.Height -le 256) {
+                return '写真の縦横が256ピクセル以下です'
+            }
+            if ([int64]$image.Width * [int64]$image.Height -gt 200000000) {
+                return '写真の画素数が200 MPを超えています'
+            }
+        }
+        catch {
+            # HEIC/WebP/AVIFなど、System.Drawingで読めない形式は除外しない。
+            return $null
+        }
+        finally {
+            if ($image) { $image.Dispose() }
+            if ($stream) { $stream.Dispose() }
+        }
+    }
+    return $null
 }
 
 function Get-CurrentMediaSnapshot {
@@ -381,6 +433,22 @@ function Add-MediaCandidate {
 
 function Queue-StableMedia {
     param([string]$Path, [string]$Fingerprint)
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $issue = Get-GooglePhotosMediaIssue $item
+        if ($issue) {
+            $script:pendingSync.Remove($Path)
+            if (-not $script:mediaState.ContainsKey($Path) -or $script:mediaState[$Path] -ne $Fingerprint) {
+                $script:mediaState[$Path] = $Fingerprint
+                Save-MediaState
+                Write-StartupLog ("Media skipped (Google Photos does not accept this file): {0} - {1}" -f $Path, $issue)
+            }
+            return
+        }
+    }
+    catch {
+        return
+    }
     if (-not $script:pendingSync.ContainsKey($Path) -or $script:pendingSync[$Path] -ne $Fingerprint) {
         $script:pendingSync[$Path] = $Fingerprint
         $script:lastMediaEventUtc = [DateTime]::UtcNow
@@ -531,9 +599,11 @@ function Set-PhotosWindowStyle {
 function Set-PhotosBackground {
     if ($script:hwnd -eq [IntPtr]::Zero -or -not [Win32]::IsWindow($script:hwnd)) { return }
     if (-not $script:normalRect) { Capture-NormalWindowRect }
-    # Chrome was launched minimized to avoid a startup flash. Restore its
-    # window before moving it off-screen; SetWindowPos alone does not change
-    # the restored bounds of a minimized window.
+    # Keep the transition hidden. Chrome is launched minimized, and restoring
+    # it while visible can flash the normal desktop rectangle for one frame.
+    [Win32]::ShowWindow($script:hwnd, [Win32]::SW_HIDE) | Out-Null
+    # SetWindowPos alone does not change the restored bounds of a minimized
+    # window, so restore it while hidden before moving it off-screen.
     [Win32]::ShowWindow($script:hwnd, [Win32]::SW_RESTORE) | Out-Null
     $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
     $offX = $screen.Left - $script:normalRect.Width - 20
@@ -559,8 +629,9 @@ function Show-PhotosWindow {
 function Start-Photos {
     param([switch]$ShowWindow)
     if ($script:starting -or $script:exitRequested) { return }
+    if ($ShowWindow) { $script:manualVisible = $true }
     if ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
-        if ($ShowWindow -or $script:authenticationRequired) { Show-PhotosWindow } else { Set-PhotosBackground }
+        if ($script:manualVisible) { Show-PhotosWindow } else { Set-PhotosBackground }
         return
     }
 
@@ -599,7 +670,7 @@ function Start-Photos {
             Capture-NormalWindowRect
             Write-StartupLog ("Chrome window attached pid={0}." -f $script:proc.Id)
         }
-        if ($ShowWindow -or $script:authenticationRequired) { Show-PhotosWindow } else { Set-PhotosBackground }
+        if ($script:manualVisible) { Show-PhotosWindow } else { Set-PhotosBackground }
     }
     finally {
         $script:starting = $false
@@ -619,10 +690,31 @@ function Stop-Photos {
     $script:lastAuthenticationCheckUtc = [DateTime]::MinValue
 }
 
+function Reload-PhotosBackground {
+    if ($script:proc -and -not $script:proc.HasExited -and
+        $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
+        Set-PhotosBackground
+        $postedDown = [Win32]::PostMessage($script:hwnd, [Win32]::WM_KEYDOWN, [IntPtr][Win32]::VK_F5, [IntPtr]::Zero)
+        $postedUp = [Win32]::PostMessage($script:hwnd, [Win32]::WM_KEYUP, [IntPtr][Win32]::VK_F5, [IntPtr]::Zero)
+        $script:lastUiReadUtc = [DateTime]::MinValue
+        $script:cachedUiNames = @()
+        if ($postedDown -and $postedUp) {
+            Write-StartupLog 'Reloading Google Photos in the background to retry pending media.'
+        }
+        else {
+            Write-StartupLog 'WARN: Google Photos background reload request was not accepted.'
+        }
+        return
+    }
+
+    Write-StartupLog 'Google Photos window was unavailable; reopening it in the background for retry.'
+    Start-Photos
+}
+
 function Ensure-SyncBrowser {
     if (-not $script:syncActive -or $script:exitRequested) { return }
     if ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
-        if ($script:authenticationRequired) {
+        if ($script:manualVisible) {
             if ($script:backgrounded) { Show-PhotosWindow }
         }
         elseif (-not $script:backgrounded) {
@@ -630,8 +722,16 @@ function Ensure-SyncBrowser {
         }
         return
     }
+    if ($script:manualVisible) {
+        $script:manualVisible = $false
+        Write-StartupLog 'Google Photos window disappeared; treating it as Hide.'
+    }
     $script:proc = $null
     $script:hwnd = [IntPtr]::Zero
+    if ($script:authenticationRequired) {
+        Write-StartupLog 'Google Photos sign-in is required; waiting for the user to press Show.'
+        return
+    }
     if ($script:syncFailureObserved) {
         if (-not $script:syncFailureBrowserExitLogWritten) {
             Write-StartupLog 'Failed sync Chrome was closed; waiting for a manual retry without restarting it.'
@@ -640,12 +740,7 @@ function Ensure-SyncBrowser {
         return
     }
     try {
-        if ($script:authenticationRequired) {
-            Write-StartupLog "Authentication recovery Chrome disappeared; reopening it on-screen."
-        }
-        else {
-            Write-StartupLog "Sync Chrome disappeared; restarting it off-screen."
-        }
+        Write-StartupLog "Sync Chrome disappeared; restarting it off-screen."
         Start-Photos
     }
     catch {
@@ -664,9 +759,12 @@ function Start-MediaSync {
         $script:syncCompletionUtc = [DateTime]::MinValue
         $script:syncFailureObserved = $false
         $script:syncFailureStatusSeenClear = $false
+        $script:syncFailureRetryCount = 0
+        $script:syncFailureNextRetryUtc = [DateTime]::MinValue
         $script:syncFailureNoticeShown = $false
         $script:syncFailureHoldNoticeWritten = $false
         $script:syncFailureBrowserExitLogWritten = $false
+        $script:syncCompletionHoldNoticeWritten = $false
         $script:syncStatusLogWritten = $false
         if ($script:authenticationRequired) { $script:authenticationDetectedDuringSync = $true }
         Write-StartupLog "Media sync session started."
@@ -790,7 +888,7 @@ function Show-PhotosAuthenticationNotice {
     else {
         $script:notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
         $script:notifyIcon.BalloonTipTitle = 'Google フォトへの再ログインが必要です'
-        $script:notifyIcon.BalloonTipText = '専用Chromeを表示しました。ログインすると同期は自動的に再開します。'
+        $script:notifyIcon.BalloonTipText = '画面を表示するにはトレイの「Show」を押してください。ログイン後、保留中の同期を再開します。'
     }
     $script:notifyIcon.ShowBalloonTip(15000)
 }
@@ -799,7 +897,7 @@ function Show-PhotosBackupFailureNotice {
     if (-not $script:notifyIcon) { return }
     $script:notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
     $script:notifyIcon.BalloonTipTitle = 'Google フォトのバックアップに失敗しました'
-    $script:notifyIcon.BalloonTipText = '未同期のファイルは完了扱いにせず保留しています。表示中のGoogleフォトで原因を確認し、「今すぐ同期」で再試行してください。'
+    $script:notifyIcon.BalloonTipText = '未同期のファイルは完了扱いにせず保留しています。トレイの「今すぐ同期」で再試行できます。'
     $script:notifyIcon.ShowBalloonTip(15000)
 }
 
@@ -813,10 +911,7 @@ function Set-PhotosAuthenticationRequired {
         if ($newlyDetected) {
             $script:authenticationNoticeShown = $false
             Save-PhotosAuthenticationState
-            Write-StartupLog 'Google Photos sign-in is required; showing the dedicated Chrome window.'
-        }
-        if ($script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
-            Show-PhotosWindow
+            Write-StartupLog 'Google Photos sign-in is required; keeping Chrome in the background until the user presses Show.'
         }
         if (-not $script:authenticationNoticeShown -and $script:notifyIcon) {
             Show-PhotosAuthenticationNotice
@@ -836,7 +931,12 @@ function Set-PhotosAuthenticationRequired {
     Show-PhotosAuthenticationNotice -Recovered
     if ($resumeBackgroundSync) {
         $script:lastMediaEventUtc = [DateTime]::UtcNow
-        Set-PhotosBackground
+        if ($script:manualVisible) {
+            Show-PhotosWindow
+        }
+        elseif ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
+            Set-PhotosBackground
+        }
     }
 }
 
@@ -886,13 +986,15 @@ function Test-PhotosSyncCompleted {
         $script:syncFailureStatusSeenClear = $true
     }
     if ($eligible -and $script:syncFailureStatusSeenClear -and $failure.Count -gt 0) {
+        if (-not $script:syncFailureObserved) {
+            $script:syncFailureNextRetryUtc = $now.AddSeconds($FailureRetrySeconds)
+        }
         $script:syncFailureObserved = $true
         if (-not $script:syncStatusLogWritten) {
             Write-StartupLog ("WARN: Google Photos reported a backup failure: " + (($failure | Select-Object -Unique) -join " | "))
             $script:syncStatusLogWritten = $true
         }
         if (-not $script:syncFailureNoticeShown) {
-            Show-PhotosWindow
             Show-PhotosBackupFailureNotice
             $script:syncFailureNoticeShown = $true
         }
@@ -919,7 +1021,15 @@ function Stop-MediaSync {
             Write-StartupLog 'Media sync remains pending after a Google Photos backup failure; Chrome stays open for review or manual retry.'
             $script:syncFailureHoldNoticeWritten = $true
         }
-        Show-PhotosWindow
+        Set-PhotosBackground
+        return
+    }
+    if (-not $script:syncCompletionObserved) {
+        if (-not $script:syncCompletionHoldNoticeWritten) {
+            Write-StartupLog 'Media sync remains pending because Google Photos has not confirmed completion; no files were marked as synced.'
+            $script:syncCompletionHoldNoticeWritten = $true
+        }
+        Set-PhotosBackground
         return
     }
     foreach ($path in @($script:pendingSync.Keys)) {
@@ -946,6 +1056,9 @@ function Stop-MediaSync {
     $script:syncFailureNoticeShown = $false
     $script:syncFailureHoldNoticeWritten = $false
     $script:syncFailureBrowserExitLogWritten = $false
+    $script:syncFailureRetryCount = 0
+    $script:syncFailureNextRetryUtc = [DateTime]::MinValue
+    $script:syncCompletionHoldNoticeWritten = $false
     $script:syncStatusLogWritten = $false
     $script:authenticationDetectedDuringSync = $false
     Stop-Photos
@@ -968,6 +1081,27 @@ function Invoke-MainTick {
     Update-PhotosAuthenticationState
     if ($script:authenticationRequired) { return }
     if ($script:syncActive) {
+        $now = [DateTime]::UtcNow
+        if (-not $script:syncCompletionObserved -and
+            ($script:syncFailureObserved -or $script:syncFailureRetryCount -gt 0) -and
+            $script:syncFailureRetryCount -lt $MaxFailureRetries -and
+            $now -ge $script:syncFailureNextRetryUtc) {
+            $script:syncFailureRetryCount++
+            $delay = [int][Math]::Min(3600, $FailureRetrySeconds * [Math]::Pow(2, $script:syncFailureRetryCount))
+            $script:syncFailureNextRetryUtc = $now.AddSeconds($delay)
+            $script:syncFailureObserved = $false
+            $script:syncFailureStatusSeenClear = $false
+            $script:syncStatusSeenClear = $false
+            $script:syncCompletionObserved = $false
+            $script:syncCompletionUtc = [DateTime]::MinValue
+            $script:syncCompletionHoldNoticeWritten = $false
+            $script:syncStatusLogWritten = $false
+            $script:lastStatusCheckUtc = [DateTime]::MinValue
+            $script:lastUiReadUtc = [DateTime]::MinValue
+            $script:cachedUiNames = @()
+            Write-StartupLog ("Retrying Google Photos backup in the background (attempt {0}/{1})." -f $script:syncFailureRetryCount, $MaxFailureRetries)
+            Reload-PhotosBackground
+        }
         $completionDetected = Test-PhotosSyncCompleted
         if ($completionDetected -and
             ([DateTime]::UtcNow - $script:lastMediaEventUtc).TotalSeconds -ge 3 -and
@@ -976,32 +1110,48 @@ function Invoke-MainTick {
             return
         }
         if (([DateTime]::UtcNow - $script:lastMediaEventUtc).TotalSeconds -ge $SyncQuietSeconds) {
-            Stop-MediaSync
+            if ($script:syncCompletionObserved -or $script:syncFailureObserved) {
+                Stop-MediaSync
+            }
+            elseif (-not $script:syncCompletionHoldNoticeWritten) {
+                Write-StartupLog 'Media sync is quiet but completion was not confirmed; keeping pending files and Chrome in the background.'
+                $script:syncCompletionHoldNoticeWritten = $true
+            }
         }
     }
 }
 
+function Hide-PhotosWindow {
+    $script:manualVisible = $false
+    if ($script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
+        if ($script:syncActive) {
+            Set-PhotosBackground
+        }
+        else {
+            Stop-Photos
+        }
+    }
+    Write-StartupLog 'Manual Chrome display cleared by Hide.'
+}
+
 function Toggle-Photos {
-    if (-not $script:proc -or $script:proc.HasExited -or $script:hwnd -eq [IntPtr]::Zero -or -not [Win32]::IsWindow($script:hwnd)) {
+    $hasBrowser = $script:proc -and -not $script:proc.HasExited -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)
+    if (-not $hasBrowser) {
+        $script:manualVisible = $true
         Start-Photos -ShowWindow
         return
     }
-    if ($script:backgrounded) {
-        Show-PhotosWindow
+    if ($script:manualVisible) {
+        Hide-PhotosWindow
+        return
     }
-    elseif ($script:authenticationRequired) {
-        Show-PhotosWindow
-    }
-    elseif ($script:syncActive) {
-        Set-PhotosBackground
-    }
-    else {
-        Stop-Photos
-        Write-StartupLog "Manual Chrome window closed to keep the tray idle."
-    }
+    $script:manualVisible = $true
+    Show-PhotosWindow
+    Write-StartupLog 'Manual Chrome display enabled by Show.'
 }
 
 function Reopen-Photos {
+    $script:manualVisible = $true
     Stop-Photos
     Start-Photos -ShowWindow
 }
@@ -1016,12 +1166,17 @@ function Request-MediaSync {
         $script:syncCompletionUtc = [DateTime]::MinValue
         $script:syncFailureObserved = $false
         $script:syncFailureStatusSeenClear = $false
+        $script:syncFailureRetryCount = 0
+        $script:syncFailureNextRetryUtc = [DateTime]::MinValue
         $script:syncFailureNoticeShown = $false
         $script:syncFailureHoldNoticeWritten = $false
         $script:syncFailureBrowserExitLogWritten = $false
+        $script:syncCompletionHoldNoticeWritten = $false
         $script:syncStatusLogWritten = $false
         Write-StartupLog 'Manual media sync retry requested after the previous backup failure.'
-        Show-PhotosWindow
+        if ($script:manualVisible -and $script:hwnd -ne [IntPtr]::Zero -and [Win32]::IsWindow($script:hwnd)) {
+            Show-PhotosWindow
+        }
     }
     else {
         $script:lastMediaEventUtc = [DateTime]::UtcNow
@@ -1038,7 +1193,7 @@ if ($script:watchRoots.Count -eq 0) {
 }
 
 $firstRun = -not (Test-Path -LiteralPath $UserDataDir)
-if ($firstRun -or $OpenNow -or $script:authenticationRequired) {
+if ($firstRun -or $OpenNow) {
     Start-Photos -ShowWindow
 }
 else {
