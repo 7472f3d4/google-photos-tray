@@ -1,13 +1,14 @@
 # Google フォト — タスクトレイ常駐
 
-Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、**Windows ログイン時に自動起動**するための一式です。最新版のPowerShell 7と.NETの標準機能を使うため、追加の常駐ツールは必要ありません。
+Google フォトの Web アプリ（PWA）を **Windows のタスクトレイ（通知領域）に常駐**させ、**Windows ログイン時に自動起動**するための一式です。最新安定版のPowerShell Coreと.NETの標準機能を使うため、追加の常駐ツールは必要ありません。
 
 ## 仕組み
 
 - `Pictures` と `Videos` の配下をファイルイベントで監視（画像・動画だけを対象）
 - 待機中はChromeを起動せず、トレイホストだけが常駐
 - メディアの追加・変更を検知したときだけ、専用Chromeを画面外の可視ウィンドウとして起動
-- Googleフォトの「バックアップしました / バックアップ完了」を検知したらChromeを終了し、CPU・メモリを解放（表示を検知できない場合は最後の変更から5分間静かになった時点を安全な代替にする）
+- Googleフォトの「バックアップしました / バックアップ完了」を検知したらChromeを終了し、CPU・メモリを解放（表示を検知できない場合は最後の変更から5分間静かになった時点を代替にする）
+- バックアップエラーや未完了件数を検知した場合は、保留ファイルを同期済み扱いにせず、Chromeを表示したまま再試行待ちにする
 - 専用プロファイルがログアウトしていたらサインイン画面を自動的に画面内へ表示し、再ログインを確認するまで同期対象を完了扱いにしない
 - トレイアイコンの左クリックで表示 / 非表示を切り替え、右クリックで「表示 / 非表示」「開き直す」「今すぐ同期」「終了」を選択
 - 専用プロファイルのため、通常のChromeのウィンドウやログイン状態に影響しない
@@ -17,7 +18,7 @@ Google フォトの「フォルダをバックアップ」はWebアプリが動�
 ## 必要環境
 
 - Windows 10 / 11
-- 最新版のPowerShell 7（`pwsh`。Windows PowerShell 5.1は使用しません）
+- 最新安定版のPowerShell Core（`pwsh`。Windows PowerShell 5.1とPreview版は使用しません）
 - Google Chrome がインストール済みであること
 - Google フォトを利用できるGoogleアカウント
 
@@ -58,8 +59,9 @@ Windowsへ再サインインした場合もログイン画面を再表示でき�
 
 ## Windows ログイン時に自動起動する
 
-PowerShell 7で、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
-インストール済みの`pwsh.exe`をファイルバージョンで比較し、最新版をWindowsの
+最新安定版のPowerShell Coreで、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
+インストール済みの安定版`pwsh.exe`をファイルバージョンで比較し、MSI / Microsoft Store
+（MSIX）版も含めた最新版をWindowsの
 タスクスケジューラへ直接登録します。Windowsログイン後25秒待ってトレイホストだけを
 起動し、Chromeはメディア変更時まで起動しません。
 
@@ -91,8 +93,8 @@ pwsh -NoProfile -File .\install_startup.ps1 -Uninstall
 | `photos_tray.ps1` | メディア監視、必要時のChrome起動、トレイアイコン管理の本体 |
 | `photos_tray_hidden.vbs` | 初回設定・手動表示用のランチャー（待機なし） |
 | `photos_tray_startup_hidden.vbs` | 互換用の非表示ランチャー（25秒待機） |
-| `resolve_latest_pwsh.vbs` | VBSから最新版の`pwsh.exe`を選ぶ共通処理 |
-| `install_startup.ps1` | 最新版PowerShell 7を使うタスクの登録 / 解除（`-Uninstall`） |
+| `resolve_latest_pwsh.vbs` | VBSからPreviewを除く最新版の`pwsh.exe`を選ぶ共通処理 |
+| `install_startup.ps1` | 最新安定版PowerShell Coreを使うタスクの登録 / 解除（`-Uninstall`） |
 
 ## 設定値を変更する場合
 
@@ -120,7 +122,7 @@ Get-Content "$env:LOCALAPPDATA\GooglePhotosTray\logs\startup.log" -Tail 80
 復旧の内容が記録されます。認証情報やChromeのプロファイル内容は記録しません。
 既知のメディア状態は `%LOCALAPPDATA%\GooglePhotosTray\media-state.json` に保存されます。
 
-認証画面の判定を変更した場合は、最新版のPowerShell 7で回帰テストを実行します。
+認証画面やバックアップ失敗処理の判定を変更した場合は、最新安定版のPowerShell Coreで回帰テストを実行します。
 
 ```powershell
 pwsh -NoProfile -File .\tests\Test-AuthenticationDetection.ps1

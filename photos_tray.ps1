@@ -2,7 +2,7 @@
 #   - Pictures / Videos を FileSystemWatcher で監視し、待機中は Chrome を起動しない
 #   - メディア変更時だけ専用 Chrome を画面外で可視状態にして Google フォトを動かす
 #   - トレイ操作時だけ通常のウィンドウを表示する
-#Requires -Version 7.0
+#Requires -PSEdition Core
 param(
     [string]$Url         = "https://photos.google.com/",
     [string]$UserDataDir = "$env:LOCALAPPDATA\GooglePhotosTray\profile",
@@ -244,6 +244,10 @@ $script:syncStatusSeenClear = $false
 $script:syncCompletionObserved = $false
 $script:syncCompletionUtc = [DateTime]::MinValue
 $script:syncFailureObserved = $false
+$script:syncFailureStatusSeenClear = $false
+$script:syncFailureNoticeShown = $false
+$script:syncFailureHoldNoticeWritten = $false
+$script:syncFailureBrowserExitLogWritten = $false
 $script:syncStatusLogWritten = $false
 $script:uiAutomationWarningWritten = $false
 $script:lastUiReadUtc = [DateTime]::MinValue
@@ -628,6 +632,13 @@ function Ensure-SyncBrowser {
     }
     $script:proc = $null
     $script:hwnd = [IntPtr]::Zero
+    if ($script:syncFailureObserved) {
+        if (-not $script:syncFailureBrowserExitLogWritten) {
+            Write-StartupLog 'Failed sync Chrome was closed; waiting for a manual retry without restarting it.'
+            $script:syncFailureBrowserExitLogWritten = $true
+        }
+        return
+    }
     try {
         if ($script:authenticationRequired) {
             Write-StartupLog "Authentication recovery Chrome disappeared; reopening it on-screen."
@@ -652,6 +663,10 @@ function Start-MediaSync {
         $script:syncCompletionObserved = $false
         $script:syncCompletionUtc = [DateTime]::MinValue
         $script:syncFailureObserved = $false
+        $script:syncFailureStatusSeenClear = $false
+        $script:syncFailureNoticeShown = $false
+        $script:syncFailureHoldNoticeWritten = $false
+        $script:syncFailureBrowserExitLogWritten = $false
         $script:syncStatusLogWritten = $false
         if ($script:authenticationRequired) { $script:authenticationDetectedDuringSync = $true }
         Write-StartupLog "Media sync session started."
@@ -702,6 +717,17 @@ function Get-PhotosStatusMessages {
     return @(Get-PhotosUiNames | Where-Object {
         $_ -match 'バックアップ|アップロード|同期|Backup|Upload|Sync'
     })
+}
+
+function Test-PhotosBackupFailureMessage {
+    param([AllowEmptyString()][string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    $text = $Message.Trim()
+
+    # UI Automation also exposes permanent help/navigation labels such as
+    # "写真の作成と追加 - バックアップ エラー". Only accept complete,
+    # user-facing failure statements so those labels cannot hold a sync open.
+    return $text -match '^(?:\d+\s*個のアイテムを)?バックアップできませんでした[。.]?$|^バックアップ(?:に)?失敗しました[。.]?$|^(?:\d+\s*個のアイテムを)?アップロードできませんでした[。.]?$|^アップロード(?:に)?失敗しました[。.]?$|^(?:\d+\s+items?\s+)?(?:could not|couldn''t) be backed up[.!]?$|^Backup failed[.!]?$|^(?:\d+\s+items?\s+)?(?:could not|couldn''t) be uploaded[.!]?$|^Upload failed[.!]?$'
 }
 
 function Test-PhotosAuthenticationRequiredFromNames {
@@ -766,6 +792,14 @@ function Show-PhotosAuthenticationNotice {
         $script:notifyIcon.BalloonTipTitle = 'Google フォトへの再ログインが必要です'
         $script:notifyIcon.BalloonTipText = '専用Chromeを表示しました。ログインすると同期は自動的に再開します。'
     }
+    $script:notifyIcon.ShowBalloonTip(15000)
+}
+
+function Show-PhotosBackupFailureNotice {
+    if (-not $script:notifyIcon) { return }
+    $script:notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+    $script:notifyIcon.BalloonTipTitle = 'Google フォトのバックアップに失敗しました'
+    $script:notifyIcon.BalloonTipText = '未同期のファイルは完了扱いにせず保留しています。表示中のGoogleフォトで原因を確認し、「今すぐ同期」で再試行してください。'
     $script:notifyIcon.ShowBalloonTip(15000)
 }
 
@@ -842,22 +876,28 @@ function Test-PhotosSyncCompleted {
     $success = @($messages | Where-Object {
         $_ -match 'バックアップしました|バックアップが完了|アップロードしました|アップロードが完了|同期が完了|Backup\s+(complete|completed)|Upload(ed)?\s+(complete|successfully)|Sync\s+(complete|completed)'
     })
-    $failure = @($messages | Where-Object {
-        $_ -match 'バックアップできませんでした|バックアップ.*失敗|バックアップ.*エラー|アップロード.*失敗|アップロード.*エラー|Backup\s+(failed|error)|Upload\s+(failed|error)'
-    })
+    $failure = @($messages | Where-Object { Test-PhotosBackupFailureMessage $_ })
+    $eligible = ($now - $script:syncStartedUtc).TotalSeconds -ge 5
 
     if ($success.Count -eq 0) {
         $script:syncStatusSeenClear = $true
     }
-    if ($failure.Count -gt 0) {
+    if ($failure.Count -eq 0) {
+        $script:syncFailureStatusSeenClear = $true
+    }
+    if ($eligible -and $script:syncFailureStatusSeenClear -and $failure.Count -gt 0) {
         $script:syncFailureObserved = $true
         if (-not $script:syncStatusLogWritten) {
             Write-StartupLog ("WARN: Google Photos reported a backup failure: " + (($failure | Select-Object -Unique) -join " | "))
             $script:syncStatusLogWritten = $true
         }
+        if (-not $script:syncFailureNoticeShown) {
+            Show-PhotosWindow
+            Show-PhotosBackupFailureNotice
+            $script:syncFailureNoticeShown = $true
+        }
     }
 
-    $eligible = ($now - $script:syncStartedUtc).TotalSeconds -ge 5
     if ($eligible -and $script:syncStatusSeenClear -and -not $script:syncFailureObserved -and $success.Count -gt 0) {
         if (-not $script:syncCompletionObserved) {
             $script:syncCompletionObserved = $true
@@ -872,6 +912,14 @@ function Stop-MediaSync {
     if (-not $script:syncActive) { return }
     if ($script:authenticationRequired) {
         Write-StartupLog 'Media sync remains pending until Google Photos sign-in is restored.'
+        return
+    }
+    if ($script:syncFailureObserved) {
+        if (-not $script:syncFailureHoldNoticeWritten) {
+            Write-StartupLog 'Media sync remains pending after a Google Photos backup failure; Chrome stays open for review or manual retry.'
+            $script:syncFailureHoldNoticeWritten = $true
+        }
+        Show-PhotosWindow
         return
     }
     foreach ($path in @($script:pendingSync.Keys)) {
@@ -894,6 +942,10 @@ function Stop-MediaSync {
     $script:syncCompletionObserved = $false
     $script:syncCompletionUtc = [DateTime]::MinValue
     $script:syncFailureObserved = $false
+    $script:syncFailureStatusSeenClear = $false
+    $script:syncFailureNoticeShown = $false
+    $script:syncFailureHoldNoticeWritten = $false
+    $script:syncFailureBrowserExitLogWritten = $false
     $script:syncStatusLogWritten = $false
     $script:authenticationDetectedDuringSync = $false
     Stop-Photos
@@ -954,6 +1006,29 @@ function Reopen-Photos {
     Start-Photos -ShowWindow
 }
 
+function Request-MediaSync {
+    if ($script:syncActive -and $script:syncFailureObserved) {
+        $script:syncStartedUtc = [DateTime]::UtcNow
+        $script:lastMediaEventUtc = $script:syncStartedUtc
+        $script:lastStatusCheckUtc = [DateTime]::MinValue
+        $script:syncStatusSeenClear = $false
+        $script:syncCompletionObserved = $false
+        $script:syncCompletionUtc = [DateTime]::MinValue
+        $script:syncFailureObserved = $false
+        $script:syncFailureStatusSeenClear = $false
+        $script:syncFailureNoticeShown = $false
+        $script:syncFailureHoldNoticeWritten = $false
+        $script:syncFailureBrowserExitLogWritten = $false
+        $script:syncStatusLogWritten = $false
+        Write-StartupLog 'Manual media sync retry requested after the previous backup failure.'
+        Show-PhotosWindow
+    }
+    else {
+        $script:lastMediaEventUtc = [DateTime]::UtcNow
+    }
+    Start-MediaSync
+}
+
 # --- 起動時の監視準備 ---
 Load-MediaState
 Initialize-MediaWatchers
@@ -1000,7 +1075,7 @@ $ni.ContextMenuStrip = $menu
 $ni.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Toggle-Photos } })
 $miToggle.add_Click({ Toggle-Photos })
 $miReopen.add_Click({ Reopen-Photos })
-$miSync.add_Click({ $script:lastMediaEventUtc = [DateTime]::UtcNow; Start-MediaSync; Write-StartupLog "Manual sync requested." })
+$miSync.add_Click({ Request-MediaSync; Write-StartupLog "Manual sync requested." })
 $miExit.add_Click({
     Write-StartupLog "Exit requested from tray menu."
     $script:exitRequested = $true

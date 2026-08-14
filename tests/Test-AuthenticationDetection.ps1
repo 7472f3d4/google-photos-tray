@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -PSEdition Core
 $ErrorActionPreference = 'Stop'
 
 $scriptPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'photos_tray.ps1'
