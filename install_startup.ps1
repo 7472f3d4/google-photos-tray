@@ -7,6 +7,30 @@ param([switch]$Uninstall)
 
 $ErrorActionPreference = "Stop"
 
+function Test-TransientPowerShellPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    # PATH may contain application-owned runtimes (for example Codex's cache).
+    # A scheduled task must not depend on a cache that its owner can replace or
+    # terminate, so reject user cache and temporary locations here.
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $transientRoots = @(
+        if ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.cache' }
+        if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Temp' }
+        if ($env:TEMP) { $env:TEMP }
+        if ($env:TMP) { $env:TMP }
+    )
+    foreach ($root in $transientRoots) {
+        if (-not $root) { continue }
+        $fullRoot = [IO.Path]::GetFullPath($root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        if ($fullPath.Equals($fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $fullPath.StartsWith($fullRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-PowerShellCandidate {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -14,6 +38,8 @@ function Get-PowerShellCandidate {
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
     if ($Path -match '(?i)\\(?:preview|pre-release|nightly)(?:\\|$)') { return $null }
+    if ((Test-TransientPowerShellPath -Path $Path) -or
+        (Test-TransientPowerShellPath -Path $LaunchPath)) { return $null }
     $file = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
     if (-not $file) { return $null }
     $version = $file.VersionInfo.FileVersionRaw
@@ -39,15 +65,6 @@ function Get-LatestPowerShellPath {
             }
         }
     }
-    foreach ($command in @(Get-Command pwsh.exe -All -ErrorAction SilentlyContinue)) {
-        if ($command.Source -and
-            $command.Source -notmatch '(?i)\\WindowsApps\\' -and
-            (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
-            $candidate = Get-PowerShellCandidate -Path $command.Source
-            if ($candidate) { $candidates.Add($candidate) }
-        }
-    }
-
     # Microsoft Store / MSIX installations live below WindowsApps and expose a
     # stable per-user alias. Resolve the package path for version comparison,
     # but launch through the alias so package updates remain automatic.
@@ -57,6 +74,19 @@ function Get-LatestPowerShellPath {
         $launchPath = if (Test-Path -LiteralPath $alias -PathType Leaf) { $alias } else { $packagePwsh }
         $candidate = Get-PowerShellCandidate -Path $packagePwsh -LaunchPath $launchPath
         if ($candidate) { $candidates.Add($candidate) }
+    }
+
+    # Only use arbitrary PATH entries as a portable-install fallback. Application
+    # runtimes can be placed on PATH but are not durable scheduled-task hosts.
+    if ($candidates.Count -eq 0) {
+        foreach ($command in @(Get-Command pwsh.exe -All -ErrorAction SilentlyContinue)) {
+            if ($command.Source -and
+                $command.Source -notmatch '(?i)\\WindowsApps\\' -and
+                (Test-Path -LiteralPath $command.Source -PathType Leaf)) {
+                $candidate = Get-PowerShellCandidate -Path $command.Source
+                if ($candidate) { $candidates.Add($candidate) }
+            }
+        }
     }
 
     $latest = $candidates |
@@ -71,7 +101,9 @@ function Get-LatestPowerShellPath {
 
 $scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $photos     = Join-Path $scriptDir "photos_tray.ps1"
+$startupVbs = Join-Path $scriptDir "photos_tray_startup_hidden.vbs"
 $taskName   = "Google Photos Tray"
+$wscript    = Join-Path $env:SystemRoot "System32\wscript.exe"
 $startup    = [Environment]::GetFolderPath("Startup")
 $lnk        = Join-Path $startup "Google Photos Tray.lnk"
 
@@ -97,11 +129,13 @@ if ($Uninstall) {
 }
 
 if (-not (Test-Path -LiteralPath $photos)) { throw "not found: $photos" }
+if (-not (Test-Path -LiteralPath $startupVbs)) { throw "not found: $startupVbs" }
+if (-not (Test-Path -LiteralPath $wscript)) { throw "not found: $wscript" }
 $pwsh = Get-LatestPowerShellPath
 
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = "-NoProfile -STA -WindowStyle Hidden -File `"$photos`" -StartupDelaySeconds 25"
-$action = New-ScheduledTaskAction -Execute $pwsh.FullName -Argument $arguments -WorkingDirectory $scriptDir
+$arguments = "`"$startupVbs`" `"$($pwsh.FullName)`""
+$action = New-ScheduledTaskAction -Execute $wscript -Argument $arguments -WorkingDirectory $scriptDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
@@ -123,6 +157,7 @@ if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) 
 if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force }
 
 Write-Host "installed scheduled task: $taskName"
+Write-Host ("-> Hidden launcher: {0}" -f $startupVbs)
 Write-Host ("-> PowerShell host: {0} ({1})" -f $pwsh.FullName, $pwsh.Version)
 Write-Host "-> Starts 25 seconds after Windows logon and retries up to 3 times if startup fails."
 Write-Host "-> To try it now, run photos_tray_hidden.vbs."

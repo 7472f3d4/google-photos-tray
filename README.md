@@ -62,8 +62,8 @@ Windowsへ再サインインした場合もログイン画面を再表示でき�
 
 最新安定版のPowerShell Coreで、配置先フォルダーへ移動してから実行します。管理者権限は不要です。
 インストール済みの安定版`pwsh.exe`をファイルバージョンで比較し、MSI / Microsoft Store
-（MSIX）版も含めた最新版をWindowsの
-タスクスケジューラへ直接登録します。Windowsログイン後25秒待ってトレイホストだけを
+（MSIX）版も含めた最新版を非表示VBSランチャーへ渡すタスクを
+タスクスケジューラへ登録します。Windowsログイン後25秒待ってトレイホストだけを
 起動し、Chromeはメディア変更時まで起動しません。
 
 ```powershell
@@ -93,7 +93,7 @@ pwsh -NoProfile -File .\install_startup.ps1 -Uninstall
 |---|---|
 | `photos_tray.ps1` | メディア監視、必要時のChrome起動、トレイアイコン管理の本体 |
 | `photos_tray_hidden.vbs` | 初回設定・手動表示用のランチャー（待機なし） |
-| `photos_tray_startup_hidden.vbs` | 互換用の非表示ランチャー（25秒待機） |
+| `photos_tray_startup_hidden.vbs` | タスクスケジューラ用の非表示ランチャー（25秒待機） |
 | `resolve_latest_pwsh.vbs` | VBSからPreviewを除く最新版の`pwsh.exe`を選ぶ共通処理 |
 | `install_startup.ps1` | 最新安定版PowerShell Coreを使うタスクの登録 / 解除（`-Uninstall`） |
 
@@ -130,4 +130,5 @@ pwsh -NoProfile -File .\tests\Test-AuthenticationDetection.ps1
 pwsh -NoProfile -File .\tests\Test-BackupFailureDetection.ps1
 pwsh -NoProfile -File .\tests\Test-DisplayState.ps1
 pwsh -NoProfile -File .\tests\Test-MediaSyncFailure.ps1
+pwsh -NoProfile -File .\tests\Test-StartupTaskDefinition.ps1
 ```
