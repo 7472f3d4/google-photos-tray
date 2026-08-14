@@ -85,6 +85,11 @@ if ($Uninstall) {
         Remove-Item -LiteralPath $lnk -Force
         Write-Host "removed legacy shortcut: $lnk"
     }
+    $userData = Join-Path $env:LOCALAPPDATA 'GooglePhotosTray'
+    if (Test-Path -LiteralPath $userData) {
+        Remove-Item -LiteralPath $userData -Recurse -Force
+        Write-Host "removed user data: $userData"
+    }
     if (-not $task -and -not (Test-Path -LiteralPath $lnk)) {
         Write-Host "not installed (nothing to remove)."
     }
